@@ -1,28 +1,20 @@
 /*
-Copyright 2022 New Vector Ltd
+Copyright 2022-2024 New Vector Ltd.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: AGPL-3.0-only
+Please see LICENSE in the repository root for full details.
 */
 
-import { FC, ReactNode, useCallback, useEffect } from "react";
+import { type FC, type ReactNode, useCallback, useEffect } from "react";
 import { useLocation } from "react-router-dom";
 import classNames from "classnames";
 import { Trans, useTranslation } from "react-i18next";
 import * as Sentry from "@sentry/react";
 import { logger } from "matrix-js-sdk/src/logger";
+import { Button } from "@vector-im/compound-web";
 
 import { Header, HeaderLogo, LeftNav, RightNav } from "./Header";
-import { LinkButton, Button } from "./button";
+import { LinkButton } from "./button";
 import styles from "./FullScreenView.module.css";
 import { TranslatedError } from "./TranslatedError";
 import { Config } from "./config/Config";
@@ -58,6 +50,7 @@ interface ErrorViewProps {
 
 export const ErrorView: FC<ErrorViewProps> = ({ error }) => {
   const location = useLocation();
+  const { confineToRoom } = useUrlParams();
   const { t } = useTranslation();
 
   useEffect(() => {
@@ -78,25 +71,16 @@ export const ErrorView: FC<ErrorViewProps> = ({ error }) => {
           : error.message}
       </p>
       <RageshakeButton description={`***Error View***: ${error.message}`} />
-      {location.pathname === "/" ? (
-        <Button
-          size="lg"
-          variant="default"
-          className={styles.homeLink}
-          onPress={onReload}
-        >
-          {t("return_home_button")}
-        </Button>
-      ) : (
-        <LinkButton
-          size="lg"
-          variant="default"
-          className={styles.homeLink}
-          to="/"
-        >
-          {t("return_home_button")}
-        </LinkButton>
-      )}
+      {!confineToRoom &&
+        (location.pathname === "/" ? (
+          <Button className={styles.homeLink} onClick={onReload}>
+            {t("return_home_button")}
+          </Button>
+        ) : (
+          <LinkButton className={styles.homeLink} to="/">
+            {t("return_home_button")}
+          </LinkButton>
+        ))}
     </FullScreenView>
   );
 };
@@ -120,12 +104,7 @@ export const CrashView: FC = () => {
       )}
 
       <RageshakeButton description="***Soft Crash***" />
-      <Button
-        size="lg"
-        variant="default"
-        className={styles.wideButton}
-        onPress={onReload}
-      >
+      <Button className={styles.wideButton} onClick={onReload}>
         {t("return_home_button")}
       </Button>
     </FullScreenView>

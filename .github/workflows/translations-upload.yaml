@@ -3,6 +3,8 @@ on:
   push:
     branches:
       - livekit
+    paths-ignore:
+      - ".github/**"
 
 jobs:
   upload:
@@ -12,9 +14,9 @@ jobs:
 
     steps:
       - name: Checkout the code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
 
       - name: Upload
-        uses: localazy/upload@v1
+        uses: localazy/upload@27e6b5c0fddf4551596b42226b1c24124335d24a # v1
         with:
           write_key: ${{ secrets.LOCALAZY_WRITE_KEY }}
