@@ -1,242 +1,35 @@
 /*
-Copyright 2023 New Vector Ltd
+Copyright 2024 New Vector Ltd.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+Please see LICENSE in the repository root for full details.
 */
 
-import {
-  AudioSource,
-  TrackReferenceOrPlaceholder,
-  VideoSource,
-  observeParticipantEvents,
-  observeParticipantMedia,
-} from "@livekit/components-core";
-import { StateObservable, state } from "@react-rxjs/core";
-import {
-  LocalParticipant,
-  LocalTrack,
-  Participant,
-  ParticipantEvent,
-  RemoteParticipant,
-  Track,
-  TrackEvent,
-  facingModeFromLocalTrack,
-} from "livekit-client";
-import { RoomMember } from "matrix-js-sdk/src/matrix";
-import {
-  BehaviorSubject,
-  combineLatest,
-  distinctUntilChanged,
-  distinctUntilKeyChanged,
-  fromEvent,
-  map,
-  of,
-  startWith,
-  switchMap,
-  takeUntil,
-} from "rxjs";
+import { type Observable } from "rxjs";
 
 import { ViewModel } from "./ViewModel";
+import { type MediaViewModel, type UserMediaViewModel } from "./MediaViewModel";
 
-function observeTrackReference(
-  participant: Participant,
-  source: Track.Source,
-): StateObservable<TrackReferenceOrPlaceholder> {
-  return state(
-    observeParticipantMedia(participant).pipe(
-      map(() => ({
-        participant,
-        publication: participant.getTrackPublication(source),
-        source,
-      })),
-      distinctUntilKeyChanged("publication"),
-    ),
-  );
+let nextId = 0;
+function createId(): string {
+  return (nextId++).toString();
 }
 
-abstract class BaseTileViewModel extends ViewModel {
-  /**
-   * Whether the tile belongs to the local user.
-   */
-  public readonly local = this.participant.isLocal;
-  /**
-   * The LiveKit video track to be shown on this tile.
-   */
-  public readonly video: StateObservable<TrackReferenceOrPlaceholder>;
-  /**
-   * Whether there should be a warning that this media is unencrypted.
-   */
-  public readonly unencryptedWarning: StateObservable<boolean>;
+export class GridTileViewModel extends ViewModel {
+  public readonly id = createId();
 
+  public constructor(public readonly media$: Observable<UserMediaViewModel>) {
+    super();
+  }
+}
+
+export class SpotlightTileViewModel extends ViewModel {
   public constructor(
-    // TODO: This is only needed for full screen toggling and can be removed as
-    // soon as that code is moved into the view models
-    public readonly id: string,
-    /**
-     * The Matrix room member to which this tile belongs.
-     */
-    // TODO: Fully separate the data layer from the UI layer by keeping the
-    // member object internal
-    public readonly member: RoomMember | undefined,
-    protected readonly participant: LocalParticipant | RemoteParticipant,
-    callEncrypted: boolean,
-    audioSource: AudioSource,
-    videoSource: VideoSource,
+    public readonly media$: Observable<MediaViewModel[]>,
+    public readonly maximised$: Observable<boolean>,
   ) {
     super();
-    const audio = observeTrackReference(participant, audioSource);
-    this.video = observeTrackReference(participant, videoSource);
-    this.unencryptedWarning = state(
-      combineLatest(
-        [audio, this.video],
-        (a, v) =>
-          callEncrypted &&
-          (a.publication?.isEncrypted === false ||
-            v.publication?.isEncrypted === false),
-      ).pipe(distinctUntilChanged()),
-    );
   }
 }
 
-/**
- * A tile displaying some media.
- */
-export type TileViewModel = UserMediaTileViewModel | ScreenShareTileViewModel;
-
-/**
- * A tile displaying some participant's user media.
- */
-export class UserMediaTileViewModel extends BaseTileViewModel {
-  /**
-   * Whether the video should be mirrored.
-   */
-  public readonly mirror = state(
-    this.video.pipe(
-      switchMap((v) => {
-        const track = v.publication?.track;
-        if (!(track instanceof LocalTrack)) return of(false);
-        // Watch for track restarts, because they indicate a camera switch
-        return fromEvent(track, TrackEvent.Restarted).pipe(
-          startWith(null),
-          // Mirror only front-facing cameras (those that face the user)
-          map(() => facingModeFromLocalTrack(track).facingMode === "user"),
-        );
-      }),
-    ),
-  );
-
-  /**
-   * Whether the participant is speaking.
-   */
-  public readonly speaking = state(
-    observeParticipantEvents(
-      this.participant,
-      ParticipantEvent.IsSpeakingChanged,
-    ).pipe(map((p) => p.isSpeaking)),
-  );
-
-  private readonly _locallyMuted = new BehaviorSubject(false);
-  /**
-   * Whether we've disabled this participant's audio.
-   */
-  public readonly locallyMuted = state(this._locallyMuted);
-
-  private readonly _localVolume = new BehaviorSubject(1);
-  /**
-   * The volume to which we've set this participant's audio, as a scalar
-   * multiplier.
-   */
-  public readonly localVolume = state(this._localVolume);
-
-  /**
-   * Whether this participant is sending audio (i.e. is unmuted on their side).
-   */
-  public readonly audioEnabled: StateObservable<boolean>;
-  /**
-   * Whether this participant is sending video.
-   */
-  public readonly videoEnabled: StateObservable<boolean>;
-
-  private readonly _cropVideo = new BehaviorSubject(true);
-  /**
-   * Whether the tile video should be contained inside the tile or be cropped to fit.
-   */
-  public readonly cropVideo = state(this._cropVideo);
-
-  public constructor(
-    id: string,
-    member: RoomMember | undefined,
-    participant: LocalParticipant | RemoteParticipant,
-    callEncrypted: boolean,
-  ) {
-    super(
-      id,
-      member,
-      participant,
-      callEncrypted,
-      Track.Source.Microphone,
-      Track.Source.Camera,
-    );
-
-    const media = observeParticipantMedia(participant);
-    this.audioEnabled = state(
-      media.pipe(map((m) => m.microphoneTrack?.isMuted === false)),
-    );
-    this.videoEnabled = state(
-      media.pipe(map((m) => m.cameraTrack?.isMuted === false)),
-    );
-
-    // Sync the local mute state and volume with LiveKit
-    if (!this.local)
-      combineLatest([this._locallyMuted, this._localVolume], (muted, volume) =>
-        muted ? 0 : volume,
-      )
-        .pipe(takeUntil(this.destroyed))
-        .subscribe((volume) => {
-          (this.participant as RemoteParticipant).setVolume(volume);
-        });
-  }
-
-  public toggleLocallyMuted(): void {
-    this._locallyMuted.next(!this._locallyMuted.value);
-  }
-
-  public toggleFitContain(): void {
-    this._cropVideo.next(!this._cropVideo.value);
-  }
-
-  public setLocalVolume(value: number): void {
-    this._localVolume.next(value);
-  }
-}
-
-/**
- * A tile displaying some participant's screen share.
- */
-export class ScreenShareTileViewModel extends BaseTileViewModel {
-  public constructor(
-    id: string,
-    member: RoomMember | undefined,
-    participant: LocalParticipant | RemoteParticipant,
-    callEncrypted: boolean,
-  ) {
-    super(
-      id,
-      member,
-      participant,
-      callEncrypted,
-      Track.Source.ScreenShareAudio,
-      Track.Source.ScreenShare,
-    );
-  }
-}
+export type TileViewModel = GridTileViewModel | SpotlightTileViewModel;

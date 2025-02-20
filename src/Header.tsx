@@ -1,25 +1,21 @@
 /*
-Copyright 2022 New Vector Ltd
+Copyright 2022-2024 New Vector Ltd.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+Please see LICENSE in the repository root for full details.
 */
 
 import classNames from "classnames";
-import { FC, HTMLAttributes, ReactNode } from "react";
+import {
+  type FC,
+  type HTMLAttributes,
+  type ReactNode,
+  forwardRef,
+} from "react";
 import { Link } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { Heading, Text } from "@vector-im/compound-web";
-import UserProfileIcon from "@vector-im/compound-design-tokens/icons/user-profile.svg?react";
+import { UserProfileIcon } from "@vector-im/compound-design-tokens/assets/web/icons";
 
 import styles from "./Header.module.css";
 import Logo from "./icons/Logo.svg?react";
@@ -32,13 +28,21 @@ interface HeaderProps extends HTMLAttributes<HTMLElement> {
   className?: string;
 }
 
-export const Header: FC<HeaderProps> = ({ children, className, ...rest }) => {
-  return (
-    <header className={classNames(styles.header, className)} {...rest}>
-      {children}
-    </header>
-  );
-};
+export const Header = forwardRef<HTMLElement, HeaderProps>(
+  ({ children, className, ...rest }, ref) => {
+    return (
+      <header
+        ref={ref}
+        className={classNames(styles.header, className)}
+        {...rest}
+      >
+        {children}
+      </header>
+    );
+  },
+);
+
+Header.displayName = "Header";
 
 interface LeftNavProps extends HTMLAttributes<HTMLElement> {
   children: ReactNode;
@@ -117,7 +121,7 @@ interface RoomHeaderInfoProps {
   name: string;
   avatarUrl: string | null;
   encrypted: boolean;
-  participantCount: number;
+  participantCount: number | null;
 }
 
 export const RoomHeaderInfo: FC<RoomHeaderInfoProps> = ({
@@ -150,7 +154,7 @@ export const RoomHeaderInfo: FC<RoomHeaderInfoProps> = ({
         </Heading>
         <EncryptionLock encrypted={encrypted} />
       </div>
-      {participantCount > 0 && (
+      {(participantCount ?? 0) > 0 && (
         <div className={styles.participantsLine}>
           <UserProfileIcon
             width={20}
@@ -158,7 +162,7 @@ export const RoomHeaderInfo: FC<RoomHeaderInfoProps> = ({
             aria-label={t("header_participants_label")}
           />
           <Text as="span" size="sm" weight="medium">
-            {t("participant_count", { count: participantCount })}
+            {t("participant_count", { count: participantCount ?? 0 })}
           </Text>
         </div>
       )}

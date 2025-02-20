@@ -1,34 +1,63 @@
 name: Build
 on:
-  pull_request: {}
+  pull_request:
+    types:
+      - synchronize
+      - opened
+      - labeled
+    paths-ignore:
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/CODEOWNERS"
+      - "docs/**"
   push:
     branches: [livekit, full-mesh]
+    paths-ignore:
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/CODEOWNERS"
+      - "docs/**"
 jobs:
-  build:
-    name: Build
+  build_element_call:
+    uses: ./.github/workflows/build-element-call.yaml
+    with:
+      vite_app_version: ${{ github.event.release.tag_name || github.sha }}
+    secrets:
+      SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+      SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+      SENTRY_URL: ${{ secrets.SENTRY_URL }}
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+  deploy_develop:
+    # Deploy livekit branch to call.element.dev after build completes
+    if: github.ref == 'refs/heads/livekit'
+    needs: build_element_call
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Yarn cache
-        uses: actions/setup-node@v4
+      - name: Deploy to call.element.dev
+        uses: actions/github-script@v6
         with:
-          cache: "yarn"
-      - name: Install dependencies
-        run: "yarn install"
-      - name: Build
-        run: "yarn run build"
-        env:
-          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
-          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
-          SENTRY_URL: ${{ secrets.SENTRY_URL }}
-          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
-          VITE_APP_VERSION: ${{ github.sha }}
-          NODE_OPTIONS: "--max-old-space-size=4096"
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: build
-          path: dist
-          # We'll only use this in a triggered job, then we're done with it
-          retention-days: 1
+          github-token: ${{ secrets.DEVELOP_DEPLOYMENT_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+                owner: 'element-hq',
+                repo: 'element-call-webapp-deployments',
+                workflow_id: 'deploy.yml',
+                ref: 'main',
+                inputs: {
+                  target: 'call.element.dev',
+                  version: '${{ github.sha }}'
+                }
+            })
+  docker_for_develop:
+    # Build docker and publish docker for livekit branch after build completes
+    if: github.ref == 'refs/heads/livekit'
+    needs: build_element_call
+    permissions:
+      contents: write
+      packages: write
+    uses: ./.github/workflows/build-and-publish-docker.yaml
+    with:
+      artifact_run_id: ${{ github.run_id }}
+      docker_tags: |
+        type=sha,format=short,event=branch
+        type=raw,value=latest-ci
+        type=raw,value=latest-ci_{{date 'X' }}
