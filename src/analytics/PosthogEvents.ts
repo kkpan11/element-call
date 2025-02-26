@@ -1,23 +1,16 @@
 /*
-Copyright 2022 The New Vector Ltd
+Copyright 2022-2024 New Vector Ltd.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+Please see LICENSE in the repository root for full details.
 */
 
-import { DisconnectReason } from "livekit-client";
+import { type DisconnectReason } from "livekit-client";
+import { logger } from "matrix-js-sdk/src/logger";
+import { type MatrixRTCSession } from "matrix-js-sdk/src/matrixrtc";
 
 import {
-  IPosthogEvent,
+  type IPosthogEvent,
   PosthogAnalytics,
   RegistrationType,
 } from "./PosthogAnalytics";
@@ -28,6 +21,9 @@ interface CallEnded extends IPosthogEvent {
   callParticipantsOnLeave: number;
   callParticipantsMax: number;
   callDuration: number;
+  roomEventEncryptionKeysSent: number;
+  roomEventEncryptionKeysReceived: number;
+  roomEventEncryptionKeysReceivedAverageAge: number;
 }
 
 export class CallEndedTracker {
@@ -51,6 +47,7 @@ export class CallEndedTracker {
     callId: string,
     callParticipantsNow: number,
     sendInstantly: boolean,
+    rtcSession: MatrixRTCSession,
   ): void {
     PosthogAnalytics.instance.trackEvent<CallEnded>(
       {
@@ -59,6 +56,16 @@ export class CallEndedTracker {
         callParticipantsMax: this.cache.maxParticipantsCount,
         callParticipantsOnLeave: callParticipantsNow,
         callDuration: (Date.now() - this.cache.startTime.getTime()) / 1000,
+        roomEventEncryptionKeysSent:
+          rtcSession.statistics.counters.roomEventEncryptionKeysSent,
+        roomEventEncryptionKeysReceived:
+          rtcSession.statistics.counters.roomEventEncryptionKeysReceived,
+        roomEventEncryptionKeysReceivedAverageAge:
+          rtcSession.statistics.counters.roomEventEncryptionKeysReceived > 0
+            ? rtcSession.statistics.totals
+                .roomEventEncryptionKeysReceivedTotalAge /
+              rtcSession.statistics.counters.roomEventEncryptionKeysReceived
+            : 0,
       },
       { send_instantly: sendInstantly },
     );
@@ -199,5 +206,40 @@ export class CallDisconnectedEventTracker {
       eventName: "CallDisconnected",
       reason,
     });
+  }
+}
+
+interface CallConnectDuration extends IPosthogEvent {
+  eventName: "CallConnectDuration";
+  totalDuration: number;
+  websocketDuration: number;
+  peerConnectionDuration: number;
+}
+
+export class CallConnectDurationTracker {
+  private connectStart = 0;
+  private websocketConnected = 0;
+  public cacheConnectStart(): void {
+    this.connectStart = Date.now();
+  }
+  public cacheWsConnect(): void {
+    this.websocketConnected = Date.now();
+  }
+
+  public track(options = { log: false }): void {
+    const now = Date.now();
+    const totalDuration = now - this.connectStart;
+    const websocketDuration = this.websocketConnected - this.connectStart;
+    const peerConnectionDuration = now - this.websocketConnected;
+    PosthogAnalytics.instance.trackEvent<CallConnectDuration>({
+      eventName: "CallConnectDuration",
+      totalDuration,
+      websocketDuration,
+      peerConnectionDuration,
+    });
+    if (options.log)
+      logger.log(
+        `Time to connect:\ntotal: ${totalDuration}ms\npeerConnection: ${websocketDuration}ms\nwebsocket: ${peerConnectionDuration}ms`,
+      );
   }
 }

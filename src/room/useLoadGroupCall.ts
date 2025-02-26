@@ -1,28 +1,38 @@
 /*
-Copyright 2022 New Vector Ltd
+Copyright 2022-2024 New Vector Ltd.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+Please see LICENSE in the repository root for full details.
 */
 
-import { useState, useEffect } from "react";
+import {
+  useState,
+  useEffect,
+  useRef,
+  useCallback,
+  type ComponentType,
+  type SVGAttributes,
+} from "react";
 import { logger } from "matrix-js-sdk/src/logger";
-import { ClientEvent, MatrixClient } from "matrix-js-sdk/src/client";
+import { EventType } from "matrix-js-sdk/src/@types/event";
+import {
+  ClientEvent,
+  type MatrixClient,
+  type RoomSummary,
+} from "matrix-js-sdk/src/client";
 import { SyncState } from "matrix-js-sdk/src/sync";
+import { type MatrixRTCSession } from "matrix-js-sdk/src/matrixrtc/MatrixRTCSession";
+import { RoomEvent, type Room } from "matrix-js-sdk/src/models/room";
+import { KnownMembership } from "matrix-js-sdk/src/types";
+import { JoinRule, MatrixError } from "matrix-js-sdk/src/matrix";
 import { useTranslation } from "react-i18next";
-import { MatrixRTCSession } from "matrix-js-sdk/src/matrixrtc/MatrixRTCSession";
+import {
+  AdminIcon,
+  CloseIcon,
+  EndCallIcon,
+} from "@vector-im/compound-design-tokens/assets/web/icons";
 
-import type { Room } from "matrix-js-sdk/src/models/room";
-import type { GroupCall } from "matrix-js-sdk/src/webrtc/groupCall";
+import { widget } from "../widget";
 
 export type GroupCallLoaded = {
   kind: "loaded";
@@ -38,51 +48,276 @@ export type GroupCallLoading = {
   kind: "loading";
 };
 
+export type GroupCallWaitForInvite = {
+  kind: "waitForInvite";
+  roomSummary: RoomSummary;
+};
+
+export type GroupCallCanKnock = {
+  kind: "canKnock";
+  roomSummary: RoomSummary;
+  knock: () => void;
+};
+
 export type GroupCallStatus =
   | GroupCallLoaded
   | GroupCallLoadFailed
-  | GroupCallLoading;
+  | GroupCallLoading
+  | GroupCallWaitForInvite
+  | GroupCallCanKnock;
 
-export interface GroupCallLoadState {
-  error?: Error;
-  groupCall?: GroupCall;
+const MAX_ATTEMPTS_FOR_INVITE_JOIN_FAILURE = 3;
+const DELAY_MS_FOR_INVITE_JOIN_FAILURE = 3000;
+
+/**
+ * Join a room, and retry on M_FORBIDDEN error in order to work
+ * around a potential race when joining rooms over federation.
+ *
+ * Will wait up to to `DELAY_MS_FOR_INVITE_JOIN_FAILURE` per attempt.
+ * Will try up to `MAX_ATTEMPTS_FOR_INVITE_JOIN_FAILURE` times.
+ *
+ * @see https://github.com/element-hq/element-call/issues/2634
+ * @param client The matrix client
+ * @param attempt Number of attempts made.
+ * @param params Parameters to pass to client.joinRoom
+ */
+async function joinRoomAfterInvite(
+  client: MatrixClient,
+  attempt = 0,
+  ...params: Parameters<MatrixClient["joinRoom"]>
+): ReturnType<MatrixClient["joinRoom"]> {
+  try {
+    return await client.joinRoom(...params);
+  } catch (ex) {
+    if (
+      ex instanceof MatrixError &&
+      ex.errcode === "M_FORBIDDEN" &&
+      attempt < MAX_ATTEMPTS_FOR_INVITE_JOIN_FAILURE
+    ) {
+      // If we were invited and got a M_FORBIDDEN, it's highly likely the server hasn't caught up yet.
+      await new Promise((r) => setTimeout(r, DELAY_MS_FOR_INVITE_JOIN_FAILURE));
+      return joinRoomAfterInvite(client, attempt + 1, ...params);
+    }
+    throw ex;
+  }
+}
+
+export class CallTerminatedMessage extends Error {
+  /**
+   * @param messageTitle The title of the call ended screen message (translated)
+   */
+  public constructor(
+    /**
+     * The icon to display with the message.
+     */
+    public readonly icon: ComponentType<SVGAttributes<SVGElement>>,
+    messageTitle: string,
+    /**
+     * The message explaining the kind of termination (kick, ban, knock reject,
+     * etc.) (translated)
+     */
+    public readonly messageBody: string,
+    /**
+     * The user-provided reason for the termination (kick/ban)
+     */
+    public readonly reason?: string,
+  ) {
+    super(messageTitle);
+  }
 }
 
 export const useLoadGroupCall = (
-  client: MatrixClient,
-  roomIdOrAlias: string,
+  client: MatrixClient | undefined,
+  roomIdOrAlias: string | null,
   viaServers: string[],
 ): GroupCallStatus => {
-  const { t } = useTranslation();
   const [state, setState] = useState<GroupCallStatus>({ kind: "loading" });
+  const activeRoom = useRef<Room | undefined>(undefined);
+  const { t } = useTranslation();
+
+  const bannedError = useCallback(
+    (): CallTerminatedMessage =>
+      new CallTerminatedMessage(
+        AdminIcon,
+        t("group_call_loader.banned_heading"),
+        t("group_call_loader.banned_body"),
+        leaveReason(),
+      ),
+    [t],
+  );
+  const knockRejectError = useCallback(
+    (): CallTerminatedMessage =>
+      new CallTerminatedMessage(
+        CloseIcon,
+        t("group_call_loader.knock_reject_heading"),
+        t("group_call_loader.knock_reject_body"),
+        leaveReason(),
+      ),
+    [t],
+  );
+  const removeNoticeError = useCallback(
+    (): CallTerminatedMessage =>
+      new CallTerminatedMessage(
+        EndCallIcon,
+        t("group_call_loader.call_ended_heading"),
+        t("group_call_loader.call_ended_body"),
+        leaveReason(),
+      ),
+    [t],
+  );
+
+  const leaveReason = (): string =>
+    activeRoom.current?.currentState
+      .getStateEvents(EventType.RoomMember, activeRoom.current?.myUserId)
+      ?.getContent().reason;
 
   useEffect(() => {
+    if (!client || !roomIdOrAlias) {
+      return;
+    }
+    const getRoomByAlias = async (alias: string): Promise<Room> => {
+      // We lowercase the localpart when we create the room, so we must lowercase
+      // it here too (we just do the whole alias). We can't do the same to room IDs
+      // though.
+      // Also, we explicitly look up the room alias here. We previously just tried to
+      // join anyway but the js-sdk recreates the room if you pass the alias for a
+      // room you're already joined to (which it probably ought not to).
+      let room: Room | null = null;
+      const lookupResult = await client.getRoomIdForAlias(alias.toLowerCase());
+      logger.info(`${alias} resolved to ${lookupResult.room_id}`);
+      room = client.getRoom(lookupResult.room_id);
+      if (!room) {
+        logger.info(`Room ${lookupResult.room_id} not found, joining.`);
+        room = await client.joinRoom(lookupResult.room_id, {
+          viaServers: lookupResult.servers,
+        });
+      } else {
+        logger.info(`Already in room ${lookupResult.room_id}, not rejoining.`);
+      }
+      return room;
+    };
+
+    const getRoomByKnocking = async (
+      roomId: string,
+      viaServers: string[],
+      onKnockSent: () => void,
+    ): Promise<Room> => {
+      await client.knockRoom(roomId, { viaServers });
+      onKnockSent();
+      return await new Promise<Room>((resolve, reject) => {
+        client.on(
+          RoomEvent.MyMembership,
+          (room, membership, prevMembership): void => {
+            if (roomId !== room.roomId) return;
+            activeRoom.current = room;
+            if (
+              membership === KnownMembership.Invite &&
+              prevMembership === KnownMembership.Knock
+            ) {
+              joinRoomAfterInvite(client, 0, room.roomId, { viaServers }).then(
+                (room) => {
+                  logger.log("Auto-joined %s", room.roomId);
+                  resolve(room);
+                },
+                reject,
+              );
+            }
+            if (membership === KnownMembership.Ban) reject(bannedError());
+            if (membership === KnownMembership.Leave)
+              reject(knockRejectError());
+          },
+        );
+      });
+    };
+
     const fetchOrCreateRoom = async (): Promise<Room> => {
       let room: Room | null = null;
       if (roomIdOrAlias[0] === "#") {
-        // We lowercase the localpart when we create the room, so we must lowercase
-        // it here too (we just do the whole alias). We can't do the same to room IDs
-        // though.
-        // Also, we explicitly look up the room alias here. We previously just tried to
-        // join anyway but the js-sdk recreates the room if you pass the alias for a
-        // room you're already joined to (which it probably ought not to).
-        const lookupResult = await client.getRoomIdForAlias(
-          roomIdOrAlias.toLowerCase(),
-        );
-        logger.info(`${roomIdOrAlias} resolved to ${lookupResult.room_id}`);
-        room = client.getRoom(lookupResult.room_id);
-        if (!room) {
-          logger.info(`Room ${lookupResult.room_id} not found, joining.`);
-          room = await client.joinRoom(lookupResult.room_id, {
-            viaServers: lookupResult.servers,
+        const alias = roomIdOrAlias;
+        // The call uses a room alias
+        room = await getRoomByAlias(alias);
+        activeRoom.current = room;
+      } else {
+        // The call uses a room_id
+        const roomId = roomIdOrAlias;
+
+        // first try if the room already exists
+        //  - in widget mode
+        //  - in SPA mode if the user already joined the room
+        room = client.getRoom(roomId);
+        activeRoom.current = room ?? undefined;
+        const membership = room?.getMyMembership();
+        if (membership === KnownMembership.Join) {
+          // room already joined so we are done here already.
+          return room!;
+        }
+        if (widget)
+          // in widget mode we never should reach this point. (getRoom should return the room.)
+          throw new Error(
+            "Room not found. The widget-api did not pass over the relevant room events/information.",
+          );
+
+        if (membership === KnownMembership.Ban) {
+          throw bannedError();
+        } else if (membership === KnownMembership.Invite) {
+          room = await client.joinRoom(roomId, {
+            viaServers,
           });
         } else {
-          logger.info(
-            `Already in room ${lookupResult.room_id}, not rejoining.`,
-          );
+          // If the room does not exist we first search for it with viaServers
+          let roomSummary: RoomSummary | undefined = undefined;
+          try {
+            roomSummary = await client.getRoomSummary(roomId, viaServers);
+          } catch (error) {
+            // If the room summary endpoint is not supported we let it be undefined and treat this case like
+            // `JoinRule.Public`.
+            // This is how the logic was done before: "we expect any room id passed to EC
+            // to be for a public call" Which is definitely not ideal but worth a try if fetching
+            // the summary crashes.
+            logger.warn(
+              `Could not load room summary to decide whether we want to join or knock.
+              EC will fallback to join as if this would be a public room.
+              Reach out to your homeserver admin to ask them about supporting the \`/summary\` endpoint (im.nheko.summary):`,
+              error,
+            );
+          }
+          if (
+            roomSummary === undefined ||
+            roomSummary.join_rule === JoinRule.Public
+          ) {
+            room = await client.joinRoom(roomId, {
+              viaServers,
+            });
+          } else if (roomSummary.join_rule === JoinRule.Knock) {
+            // bind room summary in this scope so we have it stored in a binding of type `RoomSummary`
+            // instead of `RoomSummary | undefined`. Because we use it in a promise the linter does not accept
+            // the type check from the if condition above.
+            const _roomSummary = roomSummary;
+            let knock: () => void = () => {};
+            const userPressedAskToJoinPromise: Promise<void> = new Promise(
+              (resolve) => {
+                if (_roomSummary.membership !== KnownMembership.Knock) {
+                  knock = resolve;
+                } else {
+                  // resolve immediately if the user already knocked
+                  resolve();
+                }
+              },
+            );
+            setState({ kind: "canKnock", roomSummary: _roomSummary, knock });
+            await userPressedAskToJoinPromise;
+            room = await getRoomByKnocking(
+              roomSummary.room_id,
+              viaServers,
+              () =>
+                setState({ kind: "waitForInvite", roomSummary: _roomSummary }),
+            );
+          } else {
+            throw new Error(
+              `Room ${roomSummary.room_id} is not joinable. This likely means, that the conference owner has changed the room settings to private.`,
+            );
+          }
         }
-      } else {
-        room = await client.joinRoom(roomIdOrAlias, { viaServers });
       }
 
       logger.info(
@@ -95,6 +330,7 @@ export const useLoadGroupCall = (
 
     const fetchOrCreateGroupCall = async (): Promise<MatrixRTCSession> => {
       const room = await fetchOrCreateRoom();
+      activeRoom.current = room;
       logger.debug(`Fetched / joined room ${roomIdOrAlias}`);
 
       const rtcSession = client.matrixRTC.getRoomSession(room);
@@ -119,11 +355,33 @@ export const useLoadGroupCall = (
       }
     };
 
-    waitForClientSyncing()
-      .then(fetchOrCreateGroupCall)
-      .then((rtcSession) => setState({ kind: "loaded", rtcSession }))
-      .catch((error) => setState({ kind: "failed", error }));
-  }, [client, roomIdOrAlias, viaServers, t]);
+    const observeMyMembership = async (): Promise<void> => {
+      await new Promise((_, reject) => {
+        client.on(RoomEvent.MyMembership, (_, membership) => {
+          if (membership === KnownMembership.Leave) reject(removeNoticeError());
+          if (membership === KnownMembership.Ban) reject(bannedError());
+        });
+      });
+    };
+
+    if (state.kind === "loading") {
+      logger.log("Start loading group call");
+      waitForClientSyncing()
+        .then(fetchOrCreateGroupCall)
+        .then((rtcSession) => setState({ kind: "loaded", rtcSession }))
+        .then(observeMyMembership)
+        .catch((error) => setState({ kind: "failed", error }));
+    }
+  }, [
+    bannedError,
+    client,
+    knockRejectError,
+    removeNoticeError,
+    roomIdOrAlias,
+    state,
+    t,
+    viaServers,
+  ]);
 
   return state;
 };
